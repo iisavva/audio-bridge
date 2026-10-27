@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Windows.Devices.Enumeration;
 using Windows.Foundation;
 using Windows.Media.Audio;
@@ -116,14 +117,17 @@ namespace AudioBridge
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer volumeTimer = new System.Windows.Forms.Timer();
         CancellationTokenSource cancellation = new CancellationTokenSource();
-        AudioPlaybackConnection connection;
+        readonly PhoneReceiver receiver;
+        IPlaybackLink connection { get { return receiver.Current; } }
         string wantedId;
         bool busy;
         bool closing;
         bool exitRequested;
         bool wantConnection;
-        DateTime nextAttempt;
-        string lastState;
+        int audioGeneration;
+        bool checkingTick;
+        bool suspended;
+        DateTime nextVolumeCheck;
         string phoneSessionId;
         bool updatingVolumes;
         bool adjustingVolume;
@@ -135,6 +139,9 @@ namespace AudioBridge
 
         public BridgeForm()
         {
+            receiver = new PhoneReceiver(id => new WindowsPlaybackLink(id), Post, AddLog, () => DateTime.UtcNow);
+            receiver.StateChanged += ReceiverStateChanged;
+            DiagnosticLog.Write("Audio Bridge: запуск приёмника.");
             Text = "Audio Bridge — звук ПК и Android";
             Font = new Font("Segoe UI", 10F);
             AutoScaleMode = AutoScaleMode.Font;
@@ -279,11 +286,15 @@ namespace AudioBridge
             log.Dock = DockStyle.Fill;
             log.BackColor = Color.White;
             log.AccessibleName = "Журнал подключения";
+            var logMenu = new ContextMenuStrip();
+            logMenu.Items.Add("Открыть файл журнала", null, delegate { Open(DiagnosticLog.Path); });
+            log.ContextMenuStrip = logMenu;
             layout.Controls.Add(log);
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Открыть", null, delegate { ShowWindow(); });
             menu.Items.Add("Остановить приём", null, delegate { Disconnect(); });
+            menu.Items.Add("Журнал подключения", null, delegate { Open(DiagnosticLog.Path); });
             menu.Items.Add("Выйти", null, delegate { exitRequested = true; Close(); });
             tray.Icon = Icon;
             tray.Text = "Audio Bridge";
@@ -301,6 +312,7 @@ namespace AudioBridge
                     return;
                 }
                 closing = true;
+                SystemEvents.PowerModeChanged -= PowerChanged;
                 timer.Stop();
                 volumeTimer.Stop();
                 cancellation.Cancel();
@@ -308,7 +320,8 @@ namespace AudioBridge
                 tray.Visible = false;
                 tray.Dispose();
             };
-            timer.Interval = 4000;
+            SystemEvents.PowerModeChanged += PowerChanged;
+            timer.Interval = 1000;
             timer.Tick += async delegate { await Tick(); };
             timer.Start();
             UpdateButtons();
@@ -334,11 +347,46 @@ namespace AudioBridge
 
         void ShowWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
 
+        void Post(Action action)
+        {
+            if (closing || IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(action); }
+            catch (InvalidOperationException) { }
+        }
+
+        void PowerChanged(object sender, PowerModeChangedEventArgs args)
+        {
+            Post(delegate
+            {
+                if (closing || !wantConnection) return;
+                AddLog("Питание Windows: " + args.Mode + ".");
+                if (args.Mode == PowerModes.Suspend || args.Mode == PowerModes.Resume)
+                {
+                    suspended = args.Mode == PowerModes.Suspend;
+                    cancellation.Cancel();
+                    ReleaseConnection();
+                    SetStatus(suspended ? "Windows переходит в спящий режим." : "Windows вышла из сна. "
+                        + (reconnect.Checked ? "Восстанавливаю связь с телефоном…" : "Нажми «Повторить подключение»."), false);
+                }
+            });
+        }
+
+        void ReceiverStateChanged(bool opened)
+        {
+            if (closing) return;
+            if (!opened) ReleaseAudio();
+            SetStatus(opened ? "Аудиосоединение открыто. Запусти звук на Android и на ПК."
+                : "Связь с телефоном прервалась. " + (reconnect.Checked ? "Восстанавливаю автоматически…" : "Нажми «Повторить подключение»."), !opened);
+            UpdateVolumes();
+            UpdateButtons();
+        }
+
         void UpdateButtons()
         {
-            connect.Enabled = !busy && connection == null && phones.SelectedItem != null;
-            refresh.Enabled = !busy;
-            phones.Enabled = !busy && connection == null;
+            connect.Enabled = !busy && !receiver.IsOpen && phones.SelectedItem != null;
+            connect.Text = wantConnection ? "Повторить подключение" : "Принимать звук телефона";
+            refresh.Enabled = !busy && !wantConnection;
+            phones.Enabled = !busy && !wantConnection;
             stop.Enabled = wantConnection || connection != null;
         }
 
@@ -352,6 +400,7 @@ namespace AudioBridge
 
         void AddLog(string message)
         {
+            DiagnosticLog.Write(message);
             if (closing) return;
             if (log.TextLength > 15000) log.Clear();
             log.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + message.Replace("\r\n", " ") + Environment.NewLine);
@@ -404,45 +453,36 @@ namespace AudioBridge
 
         async Task Connect()
         {
-            if (busy || closing || !wantConnection) return;
+            if (busy || closing || suspended || !wantConnection) return;
             busy = true;
+            cancellation.Cancel();
             cancellation.Dispose();
             cancellation = new CancellationTokenSource();
             var token = cancellation.Token;
-            AudioPlaybackConnection attempt = null;
             UpdateButtons();
             try
             {
-                ReleaseConnection();
                 SetStatus("Открываю аудиосоединение с телефоном…", false);
-                attempt = AudioPlaybackConnection.TryCreateFromId(wantedId);
-                if (attempt == null) throw new InvalidOperationException("Источник недоступен. Проверь Bluetooth и сопряжение телефона.");
-                connection = attempt;
-                await NativeAsync.Done(attempt.StartAsync(), token);
-                var result = await NativeAsync.Result(attempt.OpenAsync(), token);
+                bool opened = await receiver.Open(wantedId, token);
                 token.ThrowIfCancellationRequested();
-                if (result.Status != AudioPlaybackConnectionOpenResultStatus.Success)
-                    throw new InvalidOperationException("Телефон не открыл звук (" + result.Status + "). Включи «Мультимедиа» для этого ПК в Bluetooth Android.");
-                lastState = attempt.State.ToString();
-                SetStatus("Аудиосоединение открыто. Запусти звук на Android и на ПК.", false);
+                if (!opened)
+                {
+                    int seconds = Math.Max(0, (int)Math.Ceiling((receiver.NextAttempt - DateTime.UtcNow).TotalSeconds));
+                    SetStatus("Телефон пока не подключился. " + (reconnect.Checked ? "Повтор через " + seconds + " с." : "Нажми «Повторить подключение».")
+                        + "\r\nПроверь «Мультимедиа» для этого ПК на Android.", true);
+                    return;
+                }
                 await CheckOutput();
                 UpdateVolumes();
             }
-            catch (OperationCanceledException) { if (!closing) SetStatus("Приём остановлен.", false); }
+            catch (OperationCanceledException) { if (!closing && !wantConnection) SetStatus("Приём остановлен.", false); }
             catch (Exception ex)
             {
                 ReleaseConnection();
                 SetStatus(ex.Message, true);
-                if (!reconnect.Checked) wantConnection = false;
             }
             finally
             {
-                if (token.IsCancellationRequested && attempt != null)
-                {
-                    if (Object.ReferenceEquals(connection, attempt)) connection = null;
-                    try { attempt.Dispose(); } catch { }
-                }
-                nextAttempt = DateTime.UtcNow.AddSeconds(15);
                 FinishOperation();
             }
         }
@@ -461,14 +501,19 @@ namespace AudioBridge
 
         void ReleaseConnection()
         {
+            ReleaseAudio();
+            receiver.Dispose();
+        }
+
+        void ReleaseAudio()
+        {
+            audioGeneration++;
             volumePending = false;
             volumeTimer.Stop();
             StopAmplifier();
             if (volumeControl != null) { volumeControl.Dispose(); volumeControl = null; }
-            var old = connection;
-            connection = null;
-            if (old != null) { try { old.Dispose(); } catch { } }
-            lastState = null;
+            phoneSessionId = null;
+            phoneVolume.Enabled = false;
         }
 
         void Disconnect()
@@ -487,29 +532,22 @@ namespace AudioBridge
 
         async Task Tick()
         {
-            if (busy || closing) return;
+            if (busy || closing || suspended || checkingTick) return;
+            checkingTick = true;
             try
             {
-                if (connection != null)
-                {
-                    string state = connection.State.ToString();
-                    if (state != lastState)
-                    {
-                        lastState = state;
-                        SetStatus(state == "Opened" ? "Аудиосоединение открыто." : "Аудиосоединение закрыто. Проверяю возможность восстановления…", state != "Opened");
-                    }
-                    if (connection.State == AudioPlaybackConnectionState.Closed)
-                    {
-                        ReleaseConnection();
-                        if (!reconnect.Checked) wantConnection = false;
-                    }
-                }
-                if (connection == null && wantConnection && reconnect.Checked && DateTime.UtcNow >= nextAttempt)
+                receiver.Poll();
+                if (wantConnection && reconnect.Checked && receiver.RetryDue)
                     await Connect();
-                UpdateVolumes();
+                if (DateTime.UtcNow >= nextVolumeCheck)
+                {
+                    nextVolumeCheck = DateTime.UtcNow.AddSeconds(4);
+                    UpdateVolumes();
+                }
                 UpdateButtons();
             }
             catch (Exception ex) { ReleaseConnection(); SetStatus("Связь прервалась: " + ex.Message, true); }
+            finally { checkingTick = false; }
         }
 
         void UpdateVolumes()
@@ -523,7 +561,7 @@ namespace AudioBridge
                 phoneVolume.Enabled = false;
                 phonePercent.Text = "—";
                 var phone = phones.SelectedItem as PhoneItem;
-                if (connection == null || phone == null)
+                if (!receiver.IsOpen || phone == null)
                 {
                     volumeHint.Text = "Приём должен быть включён; затем запусти звук на телефоне.";
                     return;
@@ -591,6 +629,7 @@ namespace AudioBridge
             int requested = requestedPhonePercent;
             var phone = phones.SelectedItem as PhoneItem;
             var currentConnection = connection;
+            int generation = audioGeneration;
             var token = cancellation.Token;
             adjustingVolume = true;
             try
@@ -607,7 +646,7 @@ namespace AudioBridge
                 {
                     volumeHint.Text = "Подключаю усиление звука телефона…";
                     var created = await PhoneAmplifier.Create(phone.Device.Name, phoneSessionId, requested, token);
-                    if (closing || token.IsCancellationRequested || !Object.ReferenceEquals(connection, currentConnection))
+                    if (closing || token.IsCancellationRequested || generation != audioGeneration || !receiver.IsOpen || !Object.ReferenceEquals(connection, currentConnection))
                     { created.Dispose(); return; }
                     amplifier = created;
                     // The user may have dragged again while the graph opened.

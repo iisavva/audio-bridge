@@ -14,7 +14,7 @@ foreach ($name in @('System.Runtime', 'System.Runtime.InteropServices.WindowsRun
 }
 $defaultOutput = if ($BuildTests) { 'tests\AudioBridge.Tests.exe' } else { 'AudioBridge.exe' }
 $destination = if ($OutputPath) { [System.IO.Path]::GetFullPath($OutputPath) } else { Join-Path $PSScriptRoot $defaultOutput }
-$sources = @('AudioBridge.cs', 'AudioMixer.cs', 'PhoneAmplifier.cs', 'NativePhoneCapture.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
+$sources = @('AudioBridge.cs', 'AudioMixer.cs', 'PhoneAmplifier.cs', 'NativePhoneCapture.cs', 'PhoneReceiver.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 $options = @('/nologo', '/utf8output', '/target:winexe', '/platform:anycpu', '/optimize+', "/out:$destination")
 if ($BuildTests) {
     $options = @('/nologo', '/utf8output', '/target:exe', '/platform:anycpu', '/optimize+', "/out:$destination", '/main:AudioBridge.Tests.Program')

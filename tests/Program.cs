@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,6 +20,7 @@ namespace AudioBridge.Tests
             {
                 if (args.Length > 0 && args[0] == "--inputs") PrintInputs().GetAwaiter().GetResult();
                 else if (args.Length > 1 && args[0] == "--capture-id") ProbeCapture(args[1]).GetAwaiter().GetResult();
+                else if (args.Length > 0 && args[0] == "--connection") TestConnections().GetAwaiter().GetResult();
                 else Run().GetAwaiter().GetResult();
                 return 0;
             }
@@ -52,6 +54,7 @@ namespace AudioBridge.Tests
 
         static async Task Run()
         {
+            await TestConnections();
             if (!AudioMixer.IsPhoneSource("Microphone (Test Phone A2DP SNK)", "Test Phone")
                 || AudioMixer.IsPhoneSource("Microphone (Test Phone)", "Test Phone")
                 || AudioMixer.IsPhoneSource("Microphone (Other Phone A2DP SNK)", "Test Phone")
@@ -70,6 +73,134 @@ namespace AudioBridge.Tests
                     throw new Exception("Incorrect gain " + gain + ": expected " + expected + ", got " + measured);
                 Console.WriteLine("PASS: " + (gain * 100) + "%; sample peak=" + measured.ToString("F4"));
             }
+        }
+
+        static void Require(bool condition, string message)
+        {
+            if (!condition) throw new Exception(message);
+        }
+
+        static async Task TestConnections()
+        {
+            var clock = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var links = new List<FakeLink>();
+            var notifications = new Queue<Action>();
+            Func<string, IPlaybackLink> factory = delegate(string id) { var link = new FakeLink(); links.Add(link); return link; };
+            Action<string> silentLog = delegate { };
+            Action<Action> inline = action => action();
+
+            using (var receiver = new PhoneReceiver(factory, inline, silentLog, () => clock))
+            {
+                // First failure must not unregister the sink or restart StartAsync.
+                Require(!await receiver.Open("phone", CancellationToken.None), "Expected an initial timeout.");
+                var link = links[links.Count - 1];
+                Require(!link.Disposed && link.Starts == 1 && !receiver.RetryDue, "Timeout disabled the incoming receiver.");
+                clock = clock.AddSeconds(2);
+                Require(receiver.RetryDue, "First retry must be due after two seconds.");
+                link.NextOpen = delegate { link.SetOpen(true); return Task.FromResult<string>(null); };
+                Require(await receiver.Open("phone", CancellationToken.None), "Second attempt did not connect.");
+                Require(link.Starts == 1 && links.Count == 1, "Retry unnecessarily recreated the receiver.");
+
+                // Android may initiate connection without waiting for our next Open.
+                link.SetOpen(false);
+                Require(!receiver.IsOpen && !link.Disposed, "A disconnect destroyed the listening sink.");
+                link.SetOpen(true);
+                Require(receiver.IsOpen && !receiver.RetryDue, "Incoming reconnection was not recognized.");
+                link.SetOpen(false);
+                clock = clock.AddSeconds(2);
+                Require(receiver.RetryDue, "A new dropout did not reset retry delay.");
+            }
+            Console.WriteLine("PASS: timeout retry, retained sink, incoming reconnection and dropout recovery.");
+
+            links.Clear();
+            using (var receiver = new PhoneReceiver(factory, inline, silentLog, () => clock))
+            {
+                foreach (int delay in new[] { 2, 4, 8, 15, 15 })
+                {
+                    Require(!await receiver.Open("phone", CancellationToken.None), "Expected a timeout.");
+                    Require(receiver.NextAttempt == clock.AddSeconds(delay), "Incorrect retry backoff.");
+                    Require(receiver.Current != null && !links[links.Count - 1].Disposed, "A retry interval left no incoming receiver.");
+                    clock = clock.AddSeconds(delay);
+                }
+                Require(links.Count == 2 && links[0].Disposed && !links[1].Disposed, "A repeatedly failing stale receiver was not renewed.");
+            }
+            Console.WriteLine("PASS: bounded retry delays and renewal after repeated failures.");
+
+            links.Clear();
+            using (var receiver = new PhoneReceiver(factory, action => notifications.Enqueue(action), silentLog, () => clock))
+            {
+                var pending = new TaskCompletionSource<string>();
+                // Enable the link with one failed attempt, then hold Open in flight.
+                await receiver.Open("phone", CancellationToken.None);
+                var link = links[0];
+                link.NextOpen = () => pending.Task;
+                Task<bool> first = receiver.Open("phone", CancellationToken.None);
+                int opens = link.Opens;
+                Require(!await receiver.Open("phone", CancellationToken.None) && opens == link.Opens, "Concurrent Open calls overlapped.");
+                link.SetOpen(true); // Queued notification from the soon-to-be-stopped object.
+                receiver.Dispose();
+                pending.SetResult(null);
+                Require(!await first, "A completed stale Open resurrected a stopped receiver.");
+                while (notifications.Count > 0) notifications.Dequeue()();
+                Require(receiver.Current == null && !receiver.IsOpen && link.Disposed, "Stale state notification resurrected the receiver.");
+            }
+            Console.WriteLine("PASS: stop during Open, stale notifications and no overlapping attempts.");
+
+            links.Clear();
+            using (var receiver = new PhoneReceiver(factory, inline, silentLog, () => clock))
+            {
+                await receiver.Open("phone", CancellationToken.None);
+                var broken = links[0];
+                broken.NextOpen = delegate { throw new TimeoutException("OS operation timed out."); };
+                Require(!await receiver.Open("phone", CancellationToken.None) && broken.Disposed, "Native timeout did not release the failed operation's receiver.");
+                await receiver.Open("phone", CancellationToken.None);
+                Require(links.Count == 2, "Native failure did not allow a fresh receiver.");
+                var replacement = links[1];
+                replacement.SetOpen(true);
+                replacement.ThrowOnState = true;
+                receiver.Poll();
+                Require(!receiver.IsOpen && replacement.Disposed, "Adapter removal did not invalidate the receiver.");
+            }
+            Console.WriteLine("PASS: native timeout and adapter state errors recover with a fresh receiver.");
+
+            links.Clear();
+            using (var receiver = new PhoneReceiver(factory, inline, silentLog, () => clock))
+            using (var cancellation = new CancellationTokenSource())
+            {
+                await receiver.Open("phone", CancellationToken.None);
+                var pending = new TaskCompletionSource<string>();
+                var link = links[0];
+                link.NextOpen = () => pending.Task;
+                Task<bool> attempt = receiver.Open("phone", cancellation.Token);
+                cancellation.Cancel();
+                pending.SetResult(null);
+                bool canceled = false;
+                try { await attempt; } catch (OperationCanceledException) { canceled = true; }
+                Require(canceled && receiver.Current == null && link.Disposed, "Cancellation left an active receiver.");
+                await receiver.Open("phone", CancellationToken.None);
+                Require(links.Count == 2, "Reconnection after cancellation failed.");
+            }
+            Console.WriteLine("PASS: cancellation releases resources and permits reconnection.");
+        }
+
+        sealed class FakeLink : IPlaybackLink
+        {
+            bool open;
+            internal bool Disposed;
+            internal bool ThrowOnState;
+            internal int Starts, Opens;
+            internal Func<Task<string>> NextOpen = () => Task.FromResult("RequestTimedOut");
+            public bool IsOpen { get { if (ThrowOnState) throw new InvalidOperationException("Adapter unavailable."); return open; } }
+            public event EventHandler StateChanged;
+            internal void SetOpen(bool value)
+            {
+                open = value;
+                var handler = StateChanged;
+                if (handler != null) handler(this, EventArgs.Empty);
+            }
+            public Task Start(CancellationToken token) { Starts++; return Task.FromResult(0); }
+            public Task<string> Open(CancellationToken token) { Opens++; return NextOpen(); }
+            public void Dispose() { Disposed = true; }
         }
 
         static async Task<double> MeasureGain(double gain)
