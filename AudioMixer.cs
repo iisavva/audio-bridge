@@ -17,6 +17,11 @@ namespace AudioBridge
             get { float value; AudioMixer.Check(((ISimpleAudioVolume)Control).GetMasterVolume(out value)); return value; }
             set { Guid context = Guid.Empty; AudioMixer.Check(((ISimpleAudioVolume)Control).SetMasterVolume(value, ref context)); }
         }
+        internal bool Muted
+        {
+            get { bool value; AudioMixer.Check(((ISimpleAudioVolume)Control).GetMute(out value)); return value; }
+            set { Guid context = Guid.Empty; AudioMixer.Check(((ISimpleAudioVolume)Control).SetMute(value, ref context)); }
+        }
         public void Dispose() { AudioMixer.Release(Control); Control = null; }
     }
 
@@ -77,28 +82,31 @@ namespace AudioBridge
             finally { Release(enumerator); Release(managerObject); Release(device); }
         }
 
-        internal static float MasterVolume(float? newValue)
+        internal static MixerSession OpenSession(string id)
         {
-            IMMDevice device = null;
-            object volumeObject = null;
+            var sessions = Sessions();
+            MixerSession found = null;
             try
             {
-                device = DefaultOutput();
-                Guid iid = typeof(IAudioEndpointVolume).GUID;
-                Check(device.Activate(ref iid, 23, IntPtr.Zero, out volumeObject));
-                var volume = (IAudioEndpointVolume)volumeObject;
-                Guid context = Guid.Empty;
-                if (newValue.HasValue) Check(volume.SetMasterVolumeLevelScalar(newValue.Value, ref context));
-                float value;
-                Check(volume.GetMasterVolumeLevelScalar(out value));
-                return value;
+                foreach (var session in sessions)
+                    if (session.Id == id && session.State != 2) { found = session; break; }
+                if (found == null) throw new InvalidOperationException("Аудиопоток телефона больше недоступен.");
+                return found;
             }
-            finally { Release(volumeObject); Release(device); }
+            finally { foreach (var session in sessions) if (session != found) session.Dispose(); }
         }
+
+        internal static bool IsPhoneSource(string name, string phoneName)
+        {
+            return !String.IsNullOrEmpty(phoneName) && !String.IsNullOrEmpty(name)
+                && name.IndexOf(phoneName, StringComparison.OrdinalIgnoreCase) >= 0
+                && name.IndexOf("A2DP SNK", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
     }
 
-    // The method order below follows mmdeviceapi.h, audiopolicy.h and
-    // endpointvolume.h. Unused prefix methods preserve native vtable slots.
+    // Method order follows mmdeviceapi.h and audiopolicy.h. Unused prefix
+    // methods preserve native vtable slots.
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IMMDeviceEnumerator
     {
@@ -159,15 +167,4 @@ namespace AudioBridge
         [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
     }
 
-    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IAudioEndpointVolume
-    {
-        [PreserveSig] int RegisterControlChangeNotify(IntPtr callback);
-        [PreserveSig] int UnregisterControlChangeNotify(IntPtr callback);
-        [PreserveSig] int GetChannelCount(out uint count);
-        [PreserveSig] int SetMasterVolumeLevel(float value, ref Guid context);
-        [PreserveSig] int SetMasterVolumeLevelScalar(float value, ref Guid context);
-        [PreserveSig] int GetMasterVolumeLevel(out float value);
-        [PreserveSig] int GetMasterVolumeLevelScalar(out float value);
-    }
 }

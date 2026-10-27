@@ -1,4 +1,4 @@
-param([string] $OutputPath)
+param([string] $OutputPath, [switch] $BuildTests)
 $ErrorActionPreference = 'Stop'
 $framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
 if (-not (Test-Path -LiteralPath (Join-Path $framework 'csc.exe'))) {
@@ -12,7 +12,14 @@ foreach ($name in @('System.Runtime', 'System.Runtime.InteropServices.WindowsRun
     if (-not $assembly) { throw "Missing framework assembly: $name" }
     $references += '/r:' + $assembly.FullName
 }
-$destination = if ($OutputPath) { [System.IO.Path]::GetFullPath($OutputPath) } else { Join-Path $PSScriptRoot 'AudioBridge.exe' }
-& (Join-Path $framework 'csc.exe') /nologo /utf8output /target:winexe /platform:anycpu /optimize+ "/out:$destination" $references (Join-Path $PSScriptRoot 'AudioBridge.cs') (Join-Path $PSScriptRoot 'AudioMixer.cs')
+$defaultOutput = if ($BuildTests) { 'tests\AudioBridge.Tests.exe' } else { 'AudioBridge.exe' }
+$destination = if ($OutputPath) { [System.IO.Path]::GetFullPath($OutputPath) } else { Join-Path $PSScriptRoot $defaultOutput }
+$sources = @('AudioBridge.cs', 'AudioMixer.cs', 'PhoneAmplifier.cs', 'NativePhoneCapture.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
+$options = @('/nologo', '/utf8output', '/target:winexe', '/platform:anycpu', '/optimize+', "/out:$destination")
+if ($BuildTests) {
+    $options = @('/nologo', '/utf8output', '/target:exe', '/platform:anycpu', '/optimize+', "/out:$destination", '/main:AudioBridge.Tests.Program')
+    $sources += Join-Path $PSScriptRoot 'tests\Program.cs'
+}
+& (Join-Path $framework 'csc.exe') $options $references $sources
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Write-Output "Built: $destination"

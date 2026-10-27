@@ -110,12 +110,11 @@ namespace AudioBridge
         readonly CheckBox reconnect = new CheckBox();
         readonly TextBox log = new TextBox();
         readonly TrackBar phoneVolume = new TrackBar();
-        readonly TrackBar masterVolume = new TrackBar();
         readonly Label phonePercent = new Label();
-        readonly Label masterPercent = new Label();
         readonly Label volumeHint = new Label();
         readonly NotifyIcon tray = new NotifyIcon();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer volumeTimer = new System.Windows.Forms.Timer();
         CancellationTokenSource cancellation = new CancellationTokenSource();
         AudioPlaybackConnection connection;
         string wantedId;
@@ -127,6 +126,12 @@ namespace AudioBridge
         string lastState;
         string phoneSessionId;
         bool updatingVolumes;
+        bool adjustingVolume;
+        PhoneAmplifier amplifier;
+        MixerSession volumeControl;
+        bool volumePending;
+        int requestedPhonePercent;
+        DateTime lastVolumeEdit;
 
         public BridgeForm()
         {
@@ -201,19 +206,17 @@ namespace AudioBridge
             actions.Controls.Add(reconnect);
             layout.Controls.Add(actions);
 
-            var volumes = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3, RowCount = 3, Margin = new Padding(0, 0, 0, 8) };
+            var volumes = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3, RowCount = 2, Margin = new Padding(0, 0, 0, 8) };
             volumes.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 185));
             volumes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             volumes.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 55));
             volumes.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-            volumes.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
             volumes.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
             volumes.Controls.Add(Label("Телефон", 10, FontStyle.Bold, 30), 0, 0);
-            volumes.Controls.Add(Label("Общая громкость", 10, FontStyle.Regular, 30), 0, 1);
-            foreach (var slider in new[] { phoneVolume, masterVolume })
+            foreach (var slider in new[] { phoneVolume })
             {
                 slider.Minimum = 0;
-                slider.Maximum = 100;
+                slider.Maximum = 200;
                 slider.TickFrequency = 10;
                 slider.TickStyle = TickStyle.None;
                 slider.LargeChange = 5;
@@ -223,24 +226,36 @@ namespace AudioBridge
                 slider.Margin = new Padding(0);
             }
             phoneVolume.AccessibleName = "Громкость телефона";
-            masterVolume.AccessibleName = "Общая громкость ПК и телефона";
-            phoneVolume.ValueChanged += delegate { if (!updatingVolumes) ChangePhoneVolume(); };
-            masterVolume.ValueChanged += delegate
+            phoneVolume.ValueChanged += delegate
             {
                 if (updatingVolumes) return;
-                try { AudioMixer.MasterVolume(masterVolume.Value / 100F); masterPercent.Text = masterVolume.Value + "%"; }
-                catch (Exception ex) { SetStatus("Не удалось изменить общую громкость: " + ex.Message, true); }
+                requestedPhonePercent = phoneVolume.Value;
+                phonePercent.Text = requestedPhonePercent + "%";
+                lastVolumeEdit = DateTime.UtcNow;
+                volumePending = true;
+                volumeTimer.Start();
             };
-            foreach (var percent in new[] { phonePercent, masterPercent }) { percent.Dock = DockStyle.Fill; percent.TextAlign = ContentAlignment.TopRight; percent.Text = "—"; }
+            // Keep thumb movement independent of COM enumeration/graph setup.
+            // Coalesce changes and apply the latest value at most 25 times/sec.
+            volumeTimer.Interval = 40;
+            volumeTimer.Tick += async delegate
+            {
+                if (adjustingVolume) return;
+                if (!volumePending || closing) { volumeTimer.Stop(); return; }
+                volumePending = false;
+                await ChangePhoneVolume();
+                if (!volumePending) volumeTimer.Stop();
+            };
+            phonePercent.Dock = DockStyle.Fill;
+            phonePercent.TextAlign = ContentAlignment.TopRight;
+            phonePercent.Text = "—";
             volumes.Controls.Add(phoneVolume, 1, 0);
-            volumes.Controls.Add(masterVolume, 1, 1);
             volumes.Controls.Add(phonePercent, 2, 0);
-            volumes.Controls.Add(masterPercent, 2, 1);
             volumeHint.Text = "Включи воспроизведение на телефоне, чтобы появился его регулятор.";
             volumeHint.Dock = DockStyle.Fill;
             volumeHint.ForeColor = Color.DimGray;
             volumeHint.Font = new Font("Segoe UI", 9F);
-            volumes.Controls.Add(volumeHint, 0, 2);
+            volumes.Controls.Add(volumeHint, 0, 1);
             volumes.SetColumnSpan(volumeHint, 3);
             layout.Controls.Add(volumes);
 
@@ -287,6 +302,7 @@ namespace AudioBridge
                 }
                 closing = true;
                 timer.Stop();
+                volumeTimer.Stop();
                 cancellation.Cancel();
                 ReleaseConnection();
                 tray.Visible = false;
@@ -445,6 +461,10 @@ namespace AudioBridge
 
         void ReleaseConnection()
         {
+            volumePending = false;
+            volumeTimer.Stop();
+            StopAmplifier();
+            if (volumeControl != null) { volumeControl.Dispose(); volumeControl = null; }
             var old = connection;
             connection = null;
             if (old != null) { try { old.Dispose(); } catch { } }
@@ -494,15 +514,9 @@ namespace AudioBridge
 
         void UpdateVolumes()
         {
-            if (closing) return;
+            if (closing || adjustingVolume || volumePending || phoneVolume.Capture
+                || (DateTime.UtcNow - lastVolumeEdit).TotalMilliseconds < 300) return;
             updatingVolumes = true;
-            try
-            {
-                masterVolume.Value = Percent(AudioMixer.MasterVolume(null));
-                masterPercent.Text = masterVolume.Value + "%";
-                masterVolume.Enabled = true;
-            }
-            catch { masterVolume.Enabled = false; masterPercent.Text = "—"; }
             try
             {
                 phoneSessionId = null;
@@ -514,6 +528,26 @@ namespace AudioBridge
                     volumeHint.Text = "Приём должен быть включён; затем запусти звук на телефоне.";
                     return;
                 }
+                if (amplifier != null)
+                {
+                    if (amplifier.Error != null || amplifier.OutputDeviceId != MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default))
+                    {
+                        string reason = amplifier.Error ?? "Аудиовыход изменился. Усиление отключено.";
+                        StopAmplifier();
+                        SetStatus(reason, true);
+                    }
+                    else
+                    {
+                        phoneSessionId = amplifier.SourceSessionId;
+                        phoneVolume.Value = amplifier.Percent;
+                        phonePercent.Text = amplifier.Percent + "%";
+                        phoneVolume.Enabled = true;
+                        volumeHint.Text = phoneVolume.Value > 100
+                            ? "101–200%: усиление телефона; возможны искажения громких записей."
+                            : "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
+                        return;
+                    }
+                }
                 var sessions = AudioMixer.Sessions();
                 try
                 {
@@ -523,8 +557,7 @@ namespace AudioBridge
                     {
                         // Match the phone's own A2DP sink, never a shared service
                         // process ID or an unrelated desktop application's audio.
-                        if (session.State != 2 && session.Name.IndexOf(phone.Device.Name, StringComparison.OrdinalIgnoreCase) >= 0
-                            && session.Name.IndexOf("A2DP SNK", StringComparison.OrdinalIgnoreCase) >= 0)
+                        if (session.State != 2 && AudioMixer.IsPhoneSource(session.Name, phone.Device.Name))
                         { found = session; matches++; }
                     }
                     if (matches == 1)
@@ -533,7 +566,7 @@ namespace AudioBridge
                         phoneVolume.Value = Percent(found.Volume);
                         phonePercent.Text = phoneVolume.Value + "%";
                         phoneVolume.Enabled = true;
-                        volumeHint.Text = "«Телефон» меняет только Android; «Общая» — весь выбранный выход Windows.";
+                        volumeHint.Text = "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
                     }
                     else volumeHint.Text = matches > 1 ? "Несколько потоков телефона. Выбери нужный в микшере Windows." : "Запусти звук на телефоне — регулятор появится автоматически.";
                 }
@@ -545,28 +578,58 @@ namespace AudioBridge
 
         static int Percent(float value) { return Math.Max(0, Math.Min(100, (int)Math.Round(value * 100))); }
 
-        void ChangePhoneVolume()
+        void StopAmplifier()
         {
-            if (phoneSessionId == null || closing) return;
+            var old = amplifier;
+            amplifier = null;
+            if (old != null) old.Dispose();
+        }
+
+        async Task ChangePhoneVolume()
+        {
+            if (phoneSessionId == null || closing || adjustingVolume) return;
+            int requested = requestedPhonePercent;
+            var phone = phones.SelectedItem as PhoneItem;
+            var currentConnection = connection;
+            var token = cancellation.Token;
+            adjustingVolume = true;
             try
             {
-                bool changed = false;
-                var sessions = AudioMixer.Sessions();
-                try
+                if (amplifier != null)
                 {
-                    foreach (var session in sessions)
-                    {
-                        if (session.Id != phoneSessionId) continue;
-                        session.Volume = phoneVolume.Value / 100F;
-                        phonePercent.Text = phoneVolume.Value + "%";
-                        changed = true;
-                        break;
-                    }
+                    amplifier.Percent = requested;
+                    volumeHint.Text = requested > 100
+                        ? "101–200%: усиление телефона; возможны искажения громких записей."
+                        : "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
+                    return;
                 }
-                finally { foreach (var session in sessions) session.Dispose(); }
-                if (!changed) UpdateVolumes();
+                if (requested > 100)
+                {
+                    volumeHint.Text = "Подключаю усиление звука телефона…";
+                    var created = await PhoneAmplifier.Create(phone.Device.Name, phoneSessionId, requested, token);
+                    if (closing || token.IsCancellationRequested || !Object.ReferenceEquals(connection, currentConnection))
+                    { created.Dispose(); return; }
+                    amplifier = created;
+                    // The user may have dragged again while the graph opened.
+                    amplifier.Percent = requestedPhonePercent;
+                    volumeHint.Text = "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
+                    return;
+                }
+                if (volumeControl == null || volumeControl.Id != phoneSessionId)
+                {
+                    if (volumeControl != null) volumeControl.Dispose();
+                    volumeControl = AudioMixer.OpenSession(phoneSessionId);
+                }
+                volumeControl.Volume = requested / 100F;
             }
-            catch (Exception ex) { SetStatus("Не удалось изменить громкость телефона: " + ex.Message, true); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                StopAmplifier();
+                if (volumeControl != null) { volumeControl.Dispose(); volumeControl = null; }
+                SetStatus("Не удалось изменить громкость телефона: " + ex.Message, true);
+            }
+            finally { adjustingVolume = false; }
         }
     }
 }
