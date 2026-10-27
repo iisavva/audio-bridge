@@ -1,0 +1,21 @@
+# Local build outputs
+*.exe
+*.dll
+*.pdb
+*.obj
+*.log
+bin/
+obj/
+dist/
+
+# Local editor settings
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Temporary files and local environment settings
+*.tmp
+*.bak
+.env
+.env.*
