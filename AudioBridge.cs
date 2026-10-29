@@ -128,6 +128,9 @@ namespace AudioBridge
         bool checkingTick;
         bool suspended;
         DateTime nextVolumeCheck;
+        string connectedOutputId;
+        string lastAudioSummary;
+        int? restorePhonePercent;
         string phoneSessionId;
         bool updatingVolumes;
         bool adjustingVolume;
@@ -197,7 +200,7 @@ namespace AudioBridge
                 if (item == null) return;
                 wantedId = item.Device.Id;
                 wantConnection = true;
-                await Connect();
+                await Connect(receiver.IsOpen);
             };
             stop.Text = "Остановить";
             stop.AutoSize = true;
@@ -375,7 +378,12 @@ namespace AudioBridge
         {
             if (closing) return;
             if (!opened) ReleaseAudio();
-            SetStatus(opened ? "Аудиосоединение открыто. Запусти звук на Android и на ПК."
+            else
+            {
+                connectedOutputId = MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default);
+                AddLog("Аудиовыход при открытии: " + connectedOutputId);
+            }
+            SetStatus(opened ? "Bluetooth подключён. Запусти звук на Android.\r\nЕсли звука нет, нажми «Восстановить звук»."
                 : "Связь с телефоном прервалась. " + (reconnect.Checked ? "Восстанавливаю автоматически…" : "Нажми «Повторить подключение»."), !opened);
             UpdateVolumes();
             UpdateButtons();
@@ -383,8 +391,8 @@ namespace AudioBridge
 
         void UpdateButtons()
         {
-            connect.Enabled = !busy && !receiver.IsOpen && phones.SelectedItem != null;
-            connect.Text = wantConnection ? "Повторить подключение" : "Принимать звук телефона";
+            connect.Enabled = !busy && !suspended && phones.SelectedItem != null;
+            connect.Text = receiver.IsOpen ? "Восстановить звук" : wantConnection ? "Повторить подключение" : "Принимать звук телефона";
             refresh.Enabled = !busy && !wantConnection;
             phones.Enabled = !busy && !wantConnection;
             stop.Enabled = wantConnection || connection != null;
@@ -451,7 +459,7 @@ namespace AudioBridge
             catch { output.Text = "Выход Windows: проверь выбранное устройство в настройках звука."; }
         }
 
-        async Task Connect()
+        async Task Connect(bool restart = false)
         {
             if (busy || closing || suspended || !wantConnection) return;
             busy = true;
@@ -462,8 +470,15 @@ namespace AudioBridge
             UpdateButtons();
             try
             {
-                SetStatus("Открываю аудиосоединение с телефоном…", false);
-                bool opened = await receiver.Open(wantedId, token);
+                if (restart)
+                {
+                    restorePhonePercent = phoneVolume.Enabled ? phoneVolume.Value : (restorePhonePercent ?? 100);
+                    LogAudioRoute("Перед восстановлением звука");
+                    ReleaseAudio();
+                    connectedOutputId = null;
+                }
+                SetStatus(restart ? "Восстанавливаю звуковой поток телефона…" : "Открываю аудиосоединение с телефоном…", false);
+                bool opened = await receiver.Open(wantedId, token, restart);
                 token.ThrowIfCancellationRequested();
                 if (!opened)
                 {
@@ -503,11 +518,13 @@ namespace AudioBridge
         {
             ReleaseAudio();
             receiver.Dispose();
+            connectedOutputId = null;
         }
 
         void ReleaseAudio()
         {
             audioGeneration++;
+            lastAudioSummary = null;
             volumePending = false;
             volumeTimer.Stop();
             StopAmplifier();
@@ -519,6 +536,7 @@ namespace AudioBridge
         void Disconnect()
         {
             wantConnection = false;
+            restorePhonePercent = null;
             cancellation.Cancel();
             // Also release during a device refresh; stopping must never leave
             // the receiver open merely because another operation was in flight.
@@ -537,7 +555,19 @@ namespace AudioBridge
             try
             {
                 receiver.Poll();
-                if (wantConnection && reconnect.Checked && receiver.RetryDue)
+                string currentOutputId = MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default);
+                if (receiver.IsOpen && !String.IsNullOrEmpty(currentOutputId)
+                    && !String.IsNullOrEmpty(connectedOutputId) && currentOutputId != connectedOutputId)
+                {
+                    AddLog("Выход звука Windows изменился; обновляю маршрут телефона.");
+                    if (wantConnection && reconnect.Checked) await Connect(true);
+                    else
+                    {
+                        connectedOutputId = currentOutputId;
+                        SetStatus("Выход звука Windows изменился. Нажми «Восстановить звук».", true);
+                    }
+                }
+                else if (wantConnection && reconnect.Checked && receiver.RetryDue)
                     await Connect();
                 if (DateTime.UtcNow >= nextVolumeCheck)
                 {
@@ -600,13 +630,34 @@ namespace AudioBridge
                     }
                     if (matches == 1)
                     {
+                        string summary = "Аудиопоток телефона: state=" + found.State + "; volume=" + Percent(found.Volume)
+                            + "%; muted=" + found.Muted + "; session=" + found.Id;
+                        if (summary != lastAudioSummary) { AddLog(summary); lastAudioSummary = summary; }
                         phoneSessionId = found.Id;
                         phoneVolume.Value = Percent(found.Volume);
                         phonePercent.Text = phoneVolume.Value + "%";
                         phoneVolume.Enabled = true;
-                        volumeHint.Text = "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
+                        volumeHint.Text = found.Muted ? "Звук телефона выключен. Нажми «Восстановить звук»."
+                            : "Громкость телефона: 0–200%. Уровни Windows и приложений ПК не меняются.";
+                        if (restorePhonePercent.HasValue)
+                        {
+                            int restored = restorePhonePercent.Value;
+                            restorePhonePercent = null;
+                            if (restored > 0 && found.Muted) found.Muted = false;
+                            phoneVolume.Value = restored;
+                            phonePercent.Text = restored + "%";
+                            requestedPhonePercent = restored;
+                            lastVolumeEdit = DateTime.UtcNow;
+                            volumePending = true;
+                            volumeTimer.Start();
+                        }
                     }
-                    else volumeHint.Text = matches > 1 ? "Несколько потоков телефона. Выбери нужный в микшере Windows." : "Запусти звук на телефоне — регулятор появится автоматически.";
+                    else
+                    {
+                        string summary = "Аудиопоток телефона: найдено сессий=" + matches + ".";
+                        if (summary != lastAudioSummary) { AddLog(summary); lastAudioSummary = summary; }
+                        volumeHint.Text = matches > 1 ? "Несколько потоков телефона. Нажми «Восстановить звук»." : "Запусти звук на телефоне. При тишине нажми «Восстановить звук».";
+                    }
                 }
                 finally { foreach (var session in sessions) session.Dispose(); }
             }
@@ -615,6 +666,34 @@ namespace AudioBridge
         }
 
         static int Percent(float value) { return Math.Max(0, Math.Min(100, (int)Math.Round(value * 100))); }
+
+        void LogAudioRoute(string reason)
+        {
+            AddLog(reason + ": Bluetooth=" + (receiver.IsOpen ? "Opened" : "Closed")
+                + "; output=" + MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default)
+                + "; amplifier=" + (amplifier == null ? "off" : amplifier.Percent + "%") + ".");
+            try
+            {
+                var phone = phones.SelectedItem as PhoneItem;
+                var sessions = AudioMixer.Sessions();
+                try
+                {
+                    int count = 0;
+                    foreach (var session in sessions)
+                    {
+                        if (phone == null || !AudioMixer.IsPhoneSource(session.Name, phone.Device.Name)) continue;
+                        count++;
+                        float? peak = session.Peak;
+                        AddLog("Диагностика потока: state=" + session.State + "; volume=" + Percent(session.Volume)
+                            + "%; muted=" + session.Muted + "; peak=" + (peak.HasValue ? peak.Value.ToString("F4") : "unavailable")
+                            + "; session=" + session.Id);
+                    }
+                    if (count == 0) AddLog("Диагностика потока: аудиосессия телефона на текущем выходе отсутствует.");
+                }
+                finally { foreach (var session in sessions) session.Dispose(); }
+            }
+            catch (Exception ex) { AddLog("Диагностика потока недоступна: " + ex.Message); }
+        }
 
         void StopAmplifier()
         {

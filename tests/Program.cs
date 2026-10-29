@@ -21,6 +21,8 @@ namespace AudioBridge.Tests
                 if (args.Length > 0 && args[0] == "--inputs") PrintInputs().GetAwaiter().GetResult();
                 else if (args.Length > 1 && args[0] == "--capture-id") ProbeCapture(args[1]).GetAwaiter().GetResult();
                 else if (args.Length > 0 && args[0] == "--connection") TestConnections().GetAwaiter().GetResult();
+                else if (args.Length > 0 && args[0] == "--phone-status") PrintPhoneStatus();
+                else if (args.Length > 1 && args[0] == "--phone-signal") ProbePhoneSignal(args[1]).GetAwaiter().GetResult();
                 else Run().GetAwaiter().GetResult();
                 return 0;
             }
@@ -44,12 +46,66 @@ namespace AudioBridge.Tests
                 AudioMixer.Check(enumerator.GetDevice(id, out device));
                 uint state; AudioMixer.Check(device.GetState(out state));
                 Console.WriteLine("Direct capture device state=" + state);
-                using (var capture = await Task.Run(delegate { return NativePhoneCapture.Open(id); }))
+                var capture = await Task.Run(delegate { return NativePhoneCapture.Open(id); });
+                try
                 {
                     Console.WriteLine("Native format=" + capture.Encoding.Subtype + " rate=" + capture.Encoding.SampleRate + " channels=" + capture.Encoding.ChannelCount);
                 }
+                finally { capture.Dispose(); capture.Dispose(); }
+                Require(capture.WorkerStopped, "Capture initialization without Start left an active WASAPI worker.");
+                Console.WriteLine("PASS: dispose before Start releases the WASAPI worker; repeated Dispose is safe.");
             }
             finally { AudioMixer.Release(device); AudioMixer.Release(enumerator); }
+        }
+
+        static void PrintPhoneStatus()
+        {
+            var sessions = AudioMixer.Sessions();
+            try
+            {
+                foreach (var session in sessions)
+                {
+                    if (session.Name.IndexOf("A2DP SNK", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    float? peak = session.Peak;
+                    Console.WriteLine("Phone: State=" + session.State + " Volume=" + Math.Round(session.Volume * 100)
+                        + "% Muted=" + session.Muted + " Peak=" + (peak.HasValue ? peak.Value.ToString("F4") : "unavailable"));
+                }
+            }
+            finally { foreach (var session in sessions) session.Dispose(); }
+        }
+
+        static async Task ProbePhoneSignal(string phoneName)
+        {
+            var devices = await NativeAsync.Result(DeviceInformation.FindAllAsync("", null, DeviceInformationKind.Device), CancellationToken.None);
+            var ids = new List<string>();
+            foreach (var device in devices)
+                if (device.Id.StartsWith("SWD\\MMDEVAPI\\{0.0.1.", StringComparison.OrdinalIgnoreCase)
+                    && AudioMixer.IsPhoneSource(device.Name, phoneName))
+                    ids.Add(device.Id.Substring("SWD\\MMDEVAPI\\".Length));
+            if (ids.Count != 1) throw new InvalidOperationException("Expected exactly one phone A2DP input; found " + ids.Count);
+            using (var capture = await Task.Run(() => NativePhoneCapture.Open(ids[0])))
+            {
+                Console.WriteLine("Phone input: " + capture.Encoding.Subtype + "/" + capture.Encoding.BitsPerSample
+                    + " " + capture.Encoding.SampleRate + " Hz; " + capture.Encoding.ChannelCount + " channels.");
+                int bytesPerSample = checked((int)capture.Encoding.BitsPerSample / 8);
+                bool floating = String.Equals(capture.Encoding.Subtype, "Float", StringComparison.OrdinalIgnoreCase);
+                long bytes = 0;
+                double peak = 0;
+                capture.Start(delegate(byte[] pcm)
+                {
+                    Interlocked.Add(ref bytes, pcm.Length);
+                    for (int i = 0; i + bytesPerSample <= pcm.Length; i += bytesPerSample)
+                    {
+                        double sample = floating ? BitConverter.ToSingle(pcm, i)
+                            : bytesPerSample == 2 ? BitConverter.ToInt16(pcm, i) / 32768.0 : BitConverter.ToInt32(pcm, i) / 2147483648.0;
+                        peak = Math.Max(peak, Math.Abs(sample));
+                    }
+                });
+                await Task.Delay(2500);
+                capture.Dispose();
+                Console.WriteLine("Phone input bytes=" + bytes + "; peak=" + peak.ToString("F6") + "; workerStopped=" + capture.WorkerStopped + "; error=" + (capture.Error ?? "none"));
+                if (!capture.WorkerStopped) throw new Exception("Capture worker did not release the WASAPI stream after Stop.");
+            }
         }
 
         static async Task Run()
@@ -181,6 +237,33 @@ namespace AudioBridge.Tests
                 Require(links.Count == 2, "Reconnection after cancellation failed.");
             }
             Console.WriteLine("PASS: cancellation releases resources and permits reconnection.");
+
+            links.Clear();
+            Func<string, IPlaybackLink> workingFactory = delegate(string id)
+            {
+                var link = new FakeLink();
+                link.NextOpen = delegate { link.SetOpen(true); return Task.FromResult<string>(null); };
+                links.Add(link);
+                return link;
+            };
+            using (var receiver = new PhoneReceiver(workingFactory, inline, silentLog, () => clock))
+            {
+                Require(await receiver.Open("phone", CancellationToken.None), "Initial working receiver did not open.");
+                var old = links[0];
+                Task<bool> repair = receiver.Open("phone", CancellationToken.None, true);
+                Require(old.Disposed && receiver.Current == null && !receiver.IsOpen, "Repair did not release the already-open transport.");
+                Require(!await receiver.Open("phone", CancellationToken.None), "An extra attempt overlapped repair.");
+                Require(await repair && receiver.IsOpen && links.Count == 2 && links[1].Starts == 1, "Repair reused the old transport instead of opening a new one.");
+                using (var cancellation = new CancellationTokenSource())
+                {
+                    Task<bool> stoppedRepair = receiver.Open("phone", cancellation.Token, true);
+                    cancellation.Cancel();
+                    bool canceled = false;
+                    try { await stoppedRepair; } catch (OperationCanceledException) { canceled = true; }
+                    Require(canceled && receiver.Current == null && links.Count == 2, "Stop during repair created a new receiver.");
+                }
+            }
+            Console.WriteLine("PASS: explicit repair replaces an opened transport and can be canceled before reconnecting.");
         }
 
         sealed class FakeLink : IPlaybackLink

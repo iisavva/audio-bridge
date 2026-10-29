@@ -12,6 +12,15 @@ namespace AudioBridge
         internal string Name;
         internal uint ProcessId;
         internal int State;
+        internal float? Peak
+        {
+            get
+            {
+                var meter = Control as IAudioMeterInformation;
+                if (meter == null) return null;
+                float value; AudioMixer.Check(meter.GetPeakValue(out value)); return value;
+            }
+        }
         internal float Volume
         {
             get { float value; AudioMixer.Check(((ISimpleAudioVolume)Control).GetMasterVolume(out value)); return value; }
@@ -107,6 +116,12 @@ namespace AudioBridge
 
     // Method order follows mmdeviceapi.h and audiopolicy.h. Unused prefix
     // methods preserve native vtable slots.
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioMeterInformation
+    {
+        [PreserveSig] int GetPeakValue(out float peak);
+    }
+
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IMMDeviceEnumerator
     {

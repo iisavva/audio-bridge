@@ -82,7 +82,7 @@ namespace AudioBridge
             this.factory = factory; this.dispatch = dispatch; this.log = log; this.now = now;
         }
 
-        internal async Task<bool> Open(string id, CancellationToken token)
+        internal async Task<bool> Open(string id, CancellationToken token, bool restart = false)
         {
             if (opening) return false;
             opening = true;
@@ -91,6 +91,14 @@ namespace AudioBridge
             try
             {
                 token.ThrowIfCancellationRequested();
+                if (restart)
+                {
+                    log("Bluetooth: полностью перезапускаю аудиоприёмник по запросу восстановления звука.");
+                    Release();
+                    // Let Windows tear down the previous audio transport before
+                    // registering a new one. Stop cancels this delay as well.
+                    await Task.Delay(700, token);
+                }
                 if (current != null && (deviceId != id || renewBeforeOpen)) Release();
                 if (current == null)
                 {
